@@ -10,22 +10,25 @@ use errors::*;
 use physical::*;
 use std::fs::OpenOptions;
 
-pub struct Compiler {
+pub struct Interpreter {
     arena: bumpalo::Bump,
 }
 
-impl <'a> Compiler {
+type Lexer<'a> = Peekable<Shlex<'a>>;
+
+impl <'a> Interpreter {
 
     pub fn new() -> Self {
-        Compiler { arena: Bump::new() }
+        Interpreter { arena: Bump::new() }
     }
 
-    pub fn compile(&'a mut self, mut lexer: Lexer) -> InterpreterResult<Program<'a>> {
-        Ok(self.compile_statement(&mut lexer)?)
+    pub fn interpret<I: AsRef<str>>(&'a mut self, input: I) -> InterpreterResult<bool> {
+        self.arena.reset();
+        Ok(self.compile_statement(Shlex::new(input.as_ref()).peekable())?.eval()?.wait())
 
     }
 
-    pub fn compile_statement(&'a self, lexer: &mut Lexer) -> InterpreterResult<ArenaStatement<'a>> {
+    fn compile_statement(&'a self, mut lexer: Lexer) -> InterpreterResult<ArenaStatement<'a>> {
         let mut tokens = vec![];
         while let Some(token) = lexer.next() {
             match token.as_str() {
@@ -258,8 +261,6 @@ impl Statement for CD {
     fn set_stdout(&mut self, _: fn() -> Stdio) {}
 }
 
-type Lexer<'a> = Peekable<Shlex<'a>>;
-
 pub trait Statement {
     fn eval(&mut self) -> InterpreterResult<Box<dyn Process>>;
     fn set_stdin(&mut self, stdin: Stdio);
@@ -272,10 +273,9 @@ fn main() {
     //     Ok(mut p) => {p.wait();},
     //     Err(err) => {eprintln!("{}", err);}
     // };
-    match Compiler::new().compile(Shlex::new("ls | rg src > ls && whoami").peekable()).unwrap().eval() {
-        Ok(mut p) => {p.wait();},
-        Err(err) => {eprintln!("{}", err);}
-    };
-    println!("{:?}", shlex::split("ls ; ls"));
+    let mut i = Interpreter::new();
+    i.interpret("ls | rg src > ls && whoami && pwds || ls").unwrap();
+    i.interpret("ls -l && ls -z || ls -a").unwrap();
+    // println!("{:?}", shlex::split("ls ; ls"));
 }
 
