@@ -1,9 +1,17 @@
 use bumpalo::Bump;
-use shlex::{split, Shlex};
-use std::io::{BufReader, Cursor, Seek};
+use shlex::Shlex;
 use std::iter::Peekable;
+use std::process::Stdio;
 
-struct Compiler<'a> {
+mod errors;
+mod compiler;
+mod process;
+mod physical;
+use errors::*;
+use physical::*;
+
+#[allow(unused)]
+pub struct Compiler<'a> {
     arena: bumpalo::Bump,
     stmts: Option<StatementList<'a>>,
 }
@@ -16,161 +24,218 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    pub fn compile(&'a mut self, mut lexer: Lexer) -> Option<Program<'a>> {
-        self.compile_statement_list(&mut lexer)
+    pub fn compile(&'a mut self, mut lexer: Lexer) -> InterpreterResult<Option<Program<'a>>> {
+        Ok(self.compile_statement_list(&mut lexer)?)
     }
 
-    pub fn compile_statement_list(&'a self, lexer: &mut Lexer) -> Option<StatementList<'a>> {
+    pub fn compile_statement_list(&'a self, lexer: &mut Lexer) -> InterpreterResult<Option<StatementList<'a>>> {
         if lexer.peek().is_none() {
-            return None;
+            return Ok(None);
         }
-        Some(StatementList {
-            stmt: self.compile_statement(lexer),
-            smts: match self.compile_statement_list(lexer) {
+        Ok(Some(StatementList {
+            stmt: self.compile_statement(lexer)?,
+            smts: match self.compile_statement_list(lexer)? {
                 None => None,
                 Some(stmts) => Some(Box::new(stmts)),
             }
-        })
+        }))
     }
 
-    pub fn compile_statement(&'a self, lexer: &mut Lexer) -> Box<&'a dyn Statement> {
+    pub fn compile_statement(&'a self, lexer: &mut Lexer) -> InterpreterResult<Box<&'a mut dyn Statement>> {
         let mut tokens = vec![];
         while let Some(token) = lexer.next() {
             match token.as_str() {
                 ";" | "\n" => break,
-                "&&" => return And::new(&self.arena, Command::new(&self.arena, tokens), self.compile_statement(lexer)),
-                "||" => return Or::new(&self.arena, Command::new(&self.arena, tokens), self.compile_statement(lexer)),
+                "&&" => return Ok(And::new(&self.arena, Command::new(&self.arena, tokens)?, self.compile_statement(lexer)?)),
+                "||" => return Ok(Or::new(&self.arena, Command::new(&self.arena, tokens)?, self.compile_statement(lexer)?)),
+                "|" => return Ok(Pipe::new(&self.arena, Command::new(&self.arena, tokens)?, self.compile_statement(lexer)?)),
                 _ => tokens.push(token.clone()),
             }
         }
-        return Box::new(self.arena.alloc(Command { tokens }));
+        return Command::new(&self.arena, tokens);
     }
 }
-type Program<'a> = StatementList<'a>;
+pub type Program<'a> = StatementList<'a>;
 
-struct StatementList<'a> {
-    stmt: Box<&'a dyn Statement>,
+pub struct StatementList<'a> {
+    stmt: Box<&'a mut dyn Statement>,
     smts: Option<Box<StatementList<'a>>>,
 }
 
 impl Statement for StatementList<'_> {
-    fn eval(&self) {
-        self.stmt.eval();
-        if let Some(list) = &self.smts {
-            list.eval();
+    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
+        let mut p = self.stmt.eval()?;
+        p.wait();
+        if let Some(list) = self.smts.as_mut() {
+            list.eval()
+        } else {
+            Ok(p)
+        }
+    }
+
+    fn set_stdin(&mut self, stdin: Stdio) {
+        self.stmt.set_stdin(stdin);
+    }
+
+    fn set_stdout(&mut self, stdout: fn() -> Stdio) {
+        self.stmt.set_stdout(stdout)
+    }
+}
+
+struct Command {
+    inner: std::process::Command
+}
+
+impl Command {
+    fn new(arena: & Bump, mut tokens: Vec<String>) -> InterpreterResult<Box<& mut dyn Statement>> {
+        match tokens.iter().map(|t| t.as_str()).collect::<Vec<&str>>().as_slice() {
+            [] => Err(InterpreterError{message: "unexpected EOF".to_string()}),
+            ["cd"] =>  Ok(CD::new(arena, None)),
+            ["cd", path] => Ok(CD::new(arena, Some(path.to_string()))),
+            [..] => {
+                let mut inner = std::process::Command::new(tokens.remove(0));
+                inner.args(tokens);
+                Ok(Box::new(arena.alloc(Command{inner})))
+            }
         }
     }
 }
 
-trait Statement {
-    fn eval(&self);
-}
+impl Statement for Command {
+    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
+        Ok(Box::new(CommandProcess{ child: self.inner.spawn()?, result: None }))
+    }
+    fn set_stdin(&mut self, stdin: Stdio) {
+        self.inner.stdin(stdin);
+    }
 
-struct Command {
-    tokens: Vec<String>,
-}
-
-impl Command {
-    fn new(arena: & Bump, tokens: Vec<String>) -> Box<& dyn Statement> {
-        return Box::new(arena.alloc(Command{tokens}))
+    fn set_stdout(&mut self, stdout: fn() -> Stdio) {
+        self.inner.stdout(stdout());
     }
 }
 
 struct And<'a> {
-    lhs: Box<&'a dyn Statement>,
-    rhs: Box<&'a dyn Statement>,
+    lhs: Box<&'a mut dyn Statement>,
+    rhs: Box<&'a mut dyn Statement>,
 }
 
 impl <'a> And<'a> {
-    fn new(arena: &'a Bump, lhs: Box<&'a dyn Statement>, rhs: Box<&'a dyn Statement>) -> Box<&'a dyn Statement> {
+    fn new(arena: &'a Bump, lhs: Box<&'a  mut dyn Statement>, rhs: Box<&'a mut dyn Statement>) -> Box<&'a mut dyn Statement> {
         return Box::new(arena.alloc(And{lhs, rhs}))
     }
 }
 
+impl Statement for And<'_> {
+    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
+        if !self.lhs.eval()?.wait() {
+            return Err(InterpreterError{message:"".to_string()});
+        }
+        self.rhs.eval()
+    }
+    fn set_stdin(&mut self, stdin: Stdio) {
+        self.lhs.set_stdin(stdin);
+    }
+    fn set_stdout(&mut self, stdout: fn() -> Stdio) {
+        self.rhs.set_stdout(stdout);
+    }
+}
+
 struct Or<'a> {
-    lhs: Box<&'a dyn Statement>,
-    rhs: Box<&'a dyn Statement>,
+    lhs: Box<&'a mut dyn Statement>,
+    rhs: Box<&'a mut dyn Statement>,
 }
 
 impl <'a> Or<'a> {
-    fn new(arena: &'a Bump, lhs: Box<&'a dyn Statement>, rhs: Box<&'a dyn Statement>) -> Box<&'a dyn Statement> {
+    fn new(arena: &'a Bump, lhs: Box<&'a mut dyn Statement>, rhs: Box<&'a mut dyn Statement>) -> Box<&'a mut dyn Statement> {
         return Box::new(arena.alloc(Or{lhs, rhs}))
     }
 }
 
-impl Statement for Command {
-    fn eval(&self) {
-        println!("Executing {:?}", self.tokens)
-    }
-}
-
-impl Statement for And<'_> {
-    fn eval(&self) {
-        self.lhs.eval();
-        println!("AND");
-        self.rhs.eval();
-    }
-}
-
 impl Statement for Or<'_> {
-    fn eval(&self) {
-        self.lhs.eval();
-        println!("OR");
-        self.rhs.eval();
+    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
+        match self.lhs.eval() {
+            Ok(mut p) => { if p.wait() { return Ok(p) } }
+            Err(err) => eprintln!("{}", err)
+        }
+        self.rhs.eval()
+    }
+    fn set_stdin(&mut self, stdin: Stdio) {
+        self.lhs.set_stdin(stdin);
+    }
+    fn set_stdout(&mut self, stdout: fn() -> Stdio) {
+        self.lhs.set_stdout(stdout);
+        self.rhs.set_stdout(stdout);
     }
 }
 
-const OR: &str = "||";
+#[allow(unused)]
+struct Pipe<'a> {
+    lhs: Box<&'a mut dyn Statement>,
+    rhs: Box<&'a mut dyn Statement>,
+    stdout: Stdio
+}
 
-// pub struct Lexer<T> {
-//     inner: Vec<T>,
-//     pos: usize,
-// }
-//
-// impl From<Vec<String>> for Lexer<String> {
-//     fn from(tokens: Vec<String>) -> Self {
-//         Lexer {
-//             inner: tokens,
-//             pos: 0,
-//         }
-//     }
-// }
-//
-// impl<T: PartialEq> Lexer<T> {
-//     pub fn peek(&self) -> Option<&T> {
-//         self.inner.get(self.pos)
-//     }
-//
-//     pub fn next(&mut self) -> Option<&T> {
-//         if let Some(t) = self.inner.get(self.pos) {
-//             self.pos += 1;
-//             Some(t)
-//         } else {
-//             None
-//         }
-//     }
-//
-//     pub fn seek(&mut self, seek: i64) {
-//         self.pos = (self.pos as i64 + seek) as usize;
-//     }
-// }
+impl <'a> Pipe<'a> {
+    fn new(arena: &'a Bump, lhs: Box<&'a mut dyn Statement>, rhs: Box<&'a mut dyn Statement>) -> Box<&'a mut dyn Statement> {
+        let stdout = Stdio::inherit();
+        return Box::new(arena.alloc(Pipe{lhs, rhs, stdout}))
+    }
+}
+
+
+impl Statement for Pipe<'_> {
+    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
+        self.lhs.set_stdout(Stdio::piped);
+        self.rhs.set_stdin(self.lhs.eval()?.get_stdout());
+        self.rhs.eval()
+    }
+
+    fn set_stdin(&mut self, stdin: Stdio) {
+        self.lhs.set_stdin(stdin);
+    }
+
+    fn set_stdout(&mut self, stdout: fn() -> Stdio) {
+        self.rhs.set_stdout(stdout)
+    }
+}
+
+struct CD {
+    target: Option<String>,
+}
+
+impl <'a> CD {
+    fn new(arena: &'a Bump, target: Option<String>) -> Box<&'a mut dyn Statement> {
+        return Box::new(arena.alloc(CD{target}))
+    }
+}
+
+impl Statement for CD {
+    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
+       let mut p = CDProcess{ target: self.target.clone(), result: None };
+        if !p.wait() {
+            return Err(InterpreterError{message: "".to_string()})
+        }
+        Ok(Box::new(p))
+    }
+
+    fn set_stdin(&mut self, _: Stdio) {}
+
+    fn set_stdout(&mut self, _: fn() -> Stdio) {}
+}
 
 type Lexer<'a> = Peekable<Shlex<'a>>;
 
+pub trait Statement {
+    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>>;
+    fn set_stdin(&mut self, stdin: Stdio);
+    fn set_stdout(&mut self, stdout: fn() -> Stdio);
+    // fn set_stdin(&mut self) -> ()
+}
+
+
 fn main() {
-    // let arena = bumpalo::Bump::new();
-    // let mut cmd = arena.alloc(Command {
-    //     tokens: vec!["go".to_string(), "version".to_string()],
-    // });
-    // let mut rhs = arena.alloc(Command {
-    //     tokens: vec!["go".to_string(), "version".to_string()],
-    // });
-    // let mut cmd = arena.alloc(And {
-    //     lhs: Box::new(cmd),
-    //     rhs: None,
-    // });
-    // cmd.rhs = Some(Box::new(rhs));
-    // let mut a = split("asdasd asdasd").unwrap().into_iter();
-    Compiler::new().compile(Shlex::new("ls || ls -al || balls").peekable()).unwrap().eval();
-    println!("Hello, world!");
+    match Compiler::new().compile(Shlex::new("cd && cd .. || ls").peekable()).unwrap().unwrap().eval() {
+        Ok(mut p) => {p.wait();},
+        Err(err) => {eprintln!("{}", err);}
+    };
 }
