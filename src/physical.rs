@@ -1,5 +1,5 @@
 use std::process::Stdio;
-use std::path::{PathBuf, Component};
+use std::path::{PathBuf, Component, Path};
 use std::ffi::OsStr;
 
 pub trait Process {
@@ -44,20 +44,10 @@ pub struct CDProcess {
 
 impl CDProcess {
     fn expand(&self) -> PathBuf {
-        let target = if let Some(target) = &self.target {
-            PathBuf::from(target)
-        } else {
-            return PathBuf::from(dirs::home_dir().unwrap())
-        };
-        let mut pb = PathBuf::new();
-        let home = OsStr::new("~");
-        target.components().into_iter().for_each(|component| {
-            match component {
-                Component::Normal(path) if path == home => pb.push(dirs::home_dir().unwrap()),
-                path => pb.push(path)
-            }
-        });
-        pb
+        match &self.target {
+            Some(target) => expand(target),
+            None => PathBuf::from(dirs::home_dir().unwrap())
+        }
     }
 }
 
@@ -84,4 +74,16 @@ impl Process for CDProcess {
             }
         }
     }
+}
+
+pub fn expand<P: AsRef<Path>>(path: P) -> PathBuf {
+    let mut pb = PathBuf::new();
+    let home = OsStr::new("~");
+    path.as_ref().components().into_iter().for_each(|component| {
+        match component {
+            Component::Normal(path) if path == home => pb.push(dirs::home_dir().unwrap()),
+            path => pb.push(path)
+        }
+    });
+    pb
 }

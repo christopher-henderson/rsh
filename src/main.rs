@@ -5,23 +5,19 @@ use std::process::Stdio;
 
 mod errors;
 mod compiler;
-mod process;
 mod physical;
 use errors::*;
 use physical::*;
+use std::fs::OpenOptions;
 
-#[allow(unused)]
-pub struct Compiler<'a> {
+pub struct Compiler {
     arena: bumpalo::Bump,
-    stmts: Option<StatementList<'a>>,
 }
 
-impl<'a> Compiler<'a> {
+impl <'a> Compiler {
+
     pub fn new() -> Self {
-        Compiler {
-            arena: Bump::new(),
-            stmts: None,
-        }
+        Compiler { arena: Bump::new() }
     }
 
     pub fn compile(&'a mut self, mut lexer: Lexer) -> InterpreterResult<Option<Program<'a>>> {
@@ -72,11 +68,9 @@ impl Statement for StatementList<'_> {
             Ok(p)
         }
     }
-
     fn set_stdin(&mut self, stdin: Stdio) {
         self.stmt.set_stdin(stdin);
     }
-
     fn set_stdout(&mut self, stdout: fn() -> Stdio) {
         self.stmt.set_stdout(stdout)
     }
@@ -87,17 +81,26 @@ struct Command {
 }
 
 impl Command {
-    fn new(arena: & Bump, mut tokens: Vec<String>) -> InterpreterResult<Box<& mut dyn Statement>> {
+    fn new(arena: & Bump, tokens: Vec<String>) -> InterpreterResult<Box<& mut dyn Statement>> {
         match tokens.iter().map(|t| t.as_str()).collect::<Vec<&str>>().as_slice() {
             [] => Err(InterpreterError{message: "unexpected EOF".to_string()}),
             ["cd"] =>  Ok(CD::new(arena, None)),
             ["cd", path] => Ok(CD::new(arena, Some(path.to_string()))),
+            [head@.., ">", target] => Ok(Redirect::new(arena, Self::command(head), RedirectType::Truncate, target.to_string())),
+            [_, ">"] => Err(InterpreterError{message: "unexpected EOF".to_string()}),
+            [head@.., ">>", target] => Ok(Redirect::new(arena, Self::command(head), RedirectType::Append, target.to_string())),
+            [_, ">>"] => Err(InterpreterError{message: "unexpected EOF".to_string()}),
             [..] => {
-                let mut inner = std::process::Command::new(tokens.remove(0));
-                inner.args(tokens);
-                Ok(Box::new(arena.alloc(Command{inner})))
+                Ok(Box::new(arena.alloc(Command::command(tokens))))
             }
         }
+    }
+
+    fn command<S: ToString, T: IntoIterator<Item=S>>(tokens: T) -> Command {
+        let mut tokens: Vec<String> = tokens.into_iter().map(|i|i.to_string()).collect();
+        let mut inner = std::process::Command::new(tokens.remove(0));
+        inner.args(tokens);
+        Command{inner}
     }
 }
 
@@ -168,20 +171,16 @@ impl Statement for Or<'_> {
     }
 }
 
-#[allow(unused)]
 struct Pipe<'a> {
     lhs: Box<&'a mut dyn Statement>,
     rhs: Box<&'a mut dyn Statement>,
-    stdout: Stdio
 }
 
 impl <'a> Pipe<'a> {
     fn new(arena: &'a Bump, lhs: Box<&'a mut dyn Statement>, rhs: Box<&'a mut dyn Statement>) -> Box<&'a mut dyn Statement> {
-        let stdout = Stdio::inherit();
-        return Box::new(arena.alloc(Pipe{lhs, rhs, stdout}))
+        return Box::new(arena.alloc(Pipe{lhs, rhs}))
     }
 }
-
 
 impl Statement for Pipe<'_> {
     fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
@@ -189,14 +188,59 @@ impl Statement for Pipe<'_> {
         self.rhs.set_stdin(self.lhs.eval()?.get_stdout());
         self.rhs.eval()
     }
-
     fn set_stdin(&mut self, stdin: Stdio) {
         self.lhs.set_stdin(stdin);
     }
-
     fn set_stdout(&mut self, stdout: fn() -> Stdio) {
         self.rhs.set_stdout(stdout)
     }
+}
+
+struct Redirect {
+    cmd: Command,
+    target: String,
+    _type: RedirectType
+}
+
+#[derive(Clone, Copy)]
+enum RedirectType {
+    Append,
+    Truncate
+}
+
+impl Into<bool> for RedirectType {
+    fn into(self) -> bool {
+        match self {
+            RedirectType::Append => false,
+            RedirectType::Truncate => true
+        }
+    }
+}
+
+
+impl <'a> Redirect {
+    fn new(arena: &'a Bump, cmd: Command, _type: RedirectType, target: String) -> Box<&'a mut dyn Statement> {
+        return Box::new(arena.alloc(Redirect{cmd, _type, target}))
+    }
+}
+
+impl Statement for Redirect {
+    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
+        let target = physical::expand(&self.target);
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true);
+        match self._type {
+            RedirectType::Append => opts.append(true),
+            RedirectType::Truncate => opts.truncate(true)
+        };
+        let file = opts.open(target)?;
+        self.cmd.inner.stdout(file);
+        self.cmd.eval()
+    }
+    fn set_stdin(&mut self, stdin: Stdio) {
+        self.cmd.inner.stdin(stdin);
+    }
+    fn set_stdout(&mut self, _: fn() -> Stdio) {}
 }
 
 struct CD {
@@ -229,13 +273,17 @@ pub trait Statement {
     fn eval(&mut self) -> InterpreterResult<Box<dyn Process>>;
     fn set_stdin(&mut self, stdin: Stdio);
     fn set_stdout(&mut self, stdout: fn() -> Stdio);
-    // fn set_stdin(&mut self) -> ()
 }
 
 
 fn main() {
-    match Compiler::new().compile(Shlex::new("cd && cd .. || ls").peekable()).unwrap().unwrap().eval() {
+    // match Compiler::new().compile(Shlex::new("cd && cd .. && ls | rg chris").peekable()).unwrap().unwrap().eval() {
+    //     Ok(mut p) => {p.wait();},
+    //     Err(err) => {eprintln!("{}", err);}
+    // };
+    match Compiler::new().compile(Shlex::new("ls | rg src > ls && whoami").peekable()).unwrap().unwrap().eval() {
         Ok(mut p) => {p.wait();},
         Err(err) => {eprintln!("{}", err);}
     };
 }
+
