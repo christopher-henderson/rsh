@@ -28,26 +28,25 @@ impl <'a> Interpreter {
     pub fn interpret<I: AsRef<str>>(&'a mut self, input: I) -> InterpreterResult<bool> {
         self.arena.reset();
         let mut lexer = Shlex::new(input.as_ref()).peekable();
-        let mut ast = self.compile(lexer)?;
+        let mut ast = Self::compile(&self.arena, lexer)?;
         Ok(ast.eval(&mut self.environment)?.wait())
-        // Ok(self.compile_statement(Shlex::new(input.as_ref()).peekable())?.eval(&mut self.environment)?.wait())
 
     }
 
-    fn compile(&'a self, mut lexer: Lexer) -> InterpreterResult<ArenaStatement<'a>> {
+    fn compile(arena: &'a Bump, mut lexer: Lexer) -> InterpreterResult<ArenaStatement<'a>> {
         let mut tokens = vec![];
         while let Some(token) = lexer.next() {
             match token.as_str() {
-                "&&" => return Ok(self.alloc(And::new(self.compile_expression(tokens)?, self.compile(lexer)?))),
-                "||" => return Ok(self.alloc(Or::new(self.compile_expression(tokens)?, self.compile(lexer)?))),
-                "|" => return Ok(self.alloc(Pipe::new(self.compile_expression(tokens)?, self.compile(lexer)?))),
+                "&&" => return Ok(Self::alloc(arena, And::new(Self::compile_expression(arena, tokens)?, Self::compile(arena, lexer)?))),
+                "||" => return Ok(Self::alloc(arena, Or::new(Self::compile_expression(arena, tokens)?, Self::compile(arena, lexer)?))),
+                "|" => return Ok(Self::alloc(arena, Pipe::new(Self::compile_expression(arena, tokens)?, Self::compile(arena, lexer)?))),
                 _ => tokens.push(token.clone()),
             }
         }
-        return self.compile_expression(tokens);
+        return Self::compile_expression(arena, tokens);
     }
 
-    fn compile_expression(&'a self, tokens: Vec<String>) -> InterpreterResult<ArenaStatement<'a>> {
+    fn compile_expression(arena: &'a Bump, tokens: Vec<String>) -> InterpreterResult<ArenaStatement<'a>> {
         match tokens.iter().map(|t| t.as_str()).collect::<Vec<&str>>().as_slice() {
             [] => {
                 Err(InterpreterError{message: "unexpected EOF".to_string()})
@@ -65,30 +64,26 @@ impl <'a> Interpreter {
                 Err(InterpreterError{message: "unexpected EOF".to_string()})
             },
             ["cd"] =>  {
-                Ok(self.alloc(CD::new(None)))
+                Ok(Self::alloc(arena, CD::new(None)))
             },
             ["cd", path] => {
-                Ok(self.alloc(CD::new(Some(path.to_string()))))
+                Ok(Self::alloc(arena, CD::new(Some(path.to_string()))))
             },
-            ["export", kvs@..] => Ok(self.alloc(NOOP{})),
+            ["export", kvs@..] => Ok(Self::alloc(arena, Export::new(kvs)?)),
             [head@.., ">", target] => {
-                Ok(self.alloc(Redirect::new(Command::new(head), RedirectType::Truncate, target.to_string())))
+                Ok(Self::alloc(arena, Redirect::new(Command::new(head), RedirectType::Truncate, target.to_string())))
             },
             [head@.., ">>", target] => {
-                Ok(self.alloc(Redirect::new(Command::new(head), RedirectType::Append, target.to_string())))
+                Ok(Self::alloc(arena, Redirect::new(Command::new(head), RedirectType::Append, target.to_string())))
             },
             [command@..] => {
-                Ok(self.alloc(Command::new(command)))
+                Ok(Self::alloc(arena, Command::new(command)))
             }
         }
     }
 
-    fn alloc<T: Statement + 'a>(&'a self, val: T) -> ArenaStatement<'a> {
-        Box::new(self.arena.alloc(val))
-    }
-
-    fn update_environment() {
-
+    fn alloc<T: Statement + 'a>(arena: &'a Bump, val: T) -> ArenaStatement<'a> {
+        Box::new(arena.alloc(val))
     }
 }
 
@@ -127,6 +122,8 @@ impl Export {
 
 impl Statement for Export {
     fn eval(&mut self, env: &mut Environment) -> InterpreterResult<Box<dyn Process>> {
+        println!("really");
+        env.extend(self.environment.drain());
         Ok(Box::new(NOOP{}))
     }
     fn set_stdin(&mut self, _: Stdio) {}
@@ -148,6 +145,7 @@ impl Command {
 
 impl Statement for Command {
     fn eval(&mut self, env: &mut Environment) -> InterpreterResult<Box<dyn Process>> {
+        self.inner.envs(env);
         Ok(Box::new(CommandProcess{ child: self.inner.spawn()?, result: None }))
     }
     fn set_stdin(&mut self, stdin: Stdio) {
@@ -322,8 +320,11 @@ fn main() {
     //     Err(err) => {eprintln!("{}", err);}
     // };
     let mut i = Interpreter::new();
-    i.interpret("ls | rg src > ls && whoami && pwds || ls").unwrap();
-    i.interpret("ls -l && ls -z || ls -a").unwrap();
+    // i.interpret("ls | rg src > ls && whoami && pwds || ls").unwrap();
+    // i.interpret("ls -l && ls -z || ls -a").unwrap();
+    i.interpret("export MINE");
+    i.interpret("env | rg MINE");
+    i.interpret("echo $MINE");
     // println!("{:?}", shlex::split("ls ; ls"));
 }
 
