@@ -9,9 +9,12 @@ mod physical;
 use errors::*;
 use physical::*;
 use std::fs::OpenOptions;
+use std::collections::HashMap;
+use std::env::Vars;
 
 pub struct Interpreter {
     arena: bumpalo::Bump,
+    environment: Environment
 }
 
 type Lexer<'a> = Peekable<Shlex<'a>>;
@@ -19,22 +22,25 @@ type Lexer<'a> = Peekable<Shlex<'a>>;
 impl <'a> Interpreter {
 
     pub fn new() -> Self {
-        Interpreter { arena: Bump::new() }
+        Interpreter { arena: Bump::new(), environment: std::env::vars().collect() }
     }
 
     pub fn interpret<I: AsRef<str>>(&'a mut self, input: I) -> InterpreterResult<bool> {
         self.arena.reset();
-        Ok(self.compile_statement(Shlex::new(input.as_ref()).peekable())?.eval()?.wait())
+        let mut lexer = Shlex::new(input.as_ref()).peekable();
+        let mut ast = self.compile(lexer)?;
+        Ok(ast.eval(&mut self.environment)?.wait())
+        // Ok(self.compile_statement(Shlex::new(input.as_ref()).peekable())?.eval(&mut self.environment)?.wait())
 
     }
 
-    fn compile_statement(&'a self, mut lexer: Lexer) -> InterpreterResult<ArenaStatement<'a>> {
+    fn compile(&'a self, mut lexer: Lexer) -> InterpreterResult<ArenaStatement<'a>> {
         let mut tokens = vec![];
         while let Some(token) = lexer.next() {
             match token.as_str() {
-                "&&" => return Ok(self.alloc(And::new(self.compile_expression(tokens)?, self.compile_statement(lexer)?))),
-                "||" => return Ok(self.alloc(Or::new(self.compile_expression(tokens)?, self.compile_statement(lexer)?))),
-                "|" => return Ok(self.alloc(Pipe::new(self.compile_expression(tokens)?, self.compile_statement(lexer)?))),
+                "&&" => return Ok(self.alloc(And::new(self.compile_expression(tokens)?, self.compile(lexer)?))),
+                "||" => return Ok(self.alloc(Or::new(self.compile_expression(tokens)?, self.compile(lexer)?))),
+                "|" => return Ok(self.alloc(Pipe::new(self.compile_expression(tokens)?, self.compile(lexer)?))),
                 _ => tokens.push(token.clone()),
             }
         }
@@ -64,6 +70,7 @@ impl <'a> Interpreter {
             ["cd", path] => {
                 Ok(self.alloc(CD::new(Some(path.to_string()))))
             },
+            ["export", kvs@..] => Ok(self.alloc(NOOP{})),
             [head@.., ">", target] => {
                 Ok(self.alloc(Redirect::new(Command::new(head), RedirectType::Truncate, target.to_string())))
             },
@@ -79,14 +86,56 @@ impl <'a> Interpreter {
     fn alloc<T: Statement + 'a>(&'a self, val: T) -> ArenaStatement<'a> {
         Box::new(self.arena.alloc(val))
     }
+
+    fn update_environment() {
+
+    }
+}
+
+struct NOOP {}
+
+impl Statement for NOOP {
+    fn eval(&mut self, _: &mut Environment) -> InterpreterResult<Box<dyn Process>> { Ok(Box::new(NOOP{})) }
+    fn set_stdin(&mut self, _: Stdio) {}
+    fn set_stdout(&mut self, _: fn() -> Stdio) {}
+}
+
+impl Process for NOOP {
+    fn get_stdout(self: Box<Self>) -> Stdio { Stdio::null() }
+    fn wait(&mut self) -> bool { true }
+}
+
+type Environment = HashMap<String, String>;
+
+struct Export {
+    environment: Environment
+}
+
+impl Export {
+    pub fn new(pairs: &[&str]) -> InterpreterResult<Export> {
+        let mut export = Export{ environment: Environment::with_capacity(pairs.len()) };
+        for pair in pairs {
+            if pair.starts_with('=') {
+                return Err(InterpreterError{message:format!("export: '{}`: not a valid identifier", pair)})
+            }
+            let mut kv: Vec<String> = pair.split('=').map(str::to_string).collect();
+            export.environment.insert(kv.remove(0), kv.pop().unwrap_or("".to_string()));
+        }
+        Ok(export)
+    }
+}
+
+impl Statement for Export {
+    fn eval(&mut self, env: &mut Environment) -> InterpreterResult<Box<dyn Process>> {
+        Ok(Box::new(NOOP{}))
+    }
+    fn set_stdin(&mut self, _: Stdio) {}
+    fn set_stdout(&mut self, _: fn() -> Stdio) {}
 }
 
 pub type Program<'a> = ArenaStatement<'a>;
 
-
-struct Command {
-    inner: std::process::Command
-}
+struct Command { inner: std::process::Command }
 
 impl Command {
     fn new<S: ToString, T: IntoIterator<Item=S>>(tokens: T) -> Command {
@@ -98,13 +147,12 @@ impl Command {
 }
 
 impl Statement for Command {
-    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
+    fn eval(&mut self, env: &mut Environment) -> InterpreterResult<Box<dyn Process>> {
         Ok(Box::new(CommandProcess{ child: self.inner.spawn()?, result: None }))
     }
     fn set_stdin(&mut self, stdin: Stdio) {
         self.inner.stdin(stdin);
     }
-
     fn set_stdout(&mut self, stdout: fn() -> Stdio) {
         self.inner.stdout(stdout());
     }
@@ -122,11 +170,11 @@ impl <'a> And<'a> {
 }
 
 impl Statement for And<'_> {
-    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
-        if !self.lhs.eval()?.wait() {
+    fn eval(&mut self, env: &mut Environment) -> InterpreterResult<Box<dyn Process>> {
+        if !self.lhs.eval(env)?.wait() {
             return Err(InterpreterError{message:"".to_string()});
         }
-        self.rhs.eval()
+        self.rhs.eval(env)
     }
     fn set_stdin(&mut self, stdin: Stdio) {
         self.lhs.set_stdin(stdin);
@@ -148,12 +196,12 @@ impl <'a> Or<'a> {
 }
 
 impl Statement for Or<'_> {
-    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
-        match self.lhs.eval() {
+    fn eval(&mut self, env: &mut Environment) -> InterpreterResult<Box<dyn Process>> {
+        match self.lhs.eval(env) {
             Ok(mut p) => { if p.wait() { return Ok(p) } }
             Err(err) => eprintln!("{}", err)
         }
-        self.rhs.eval()
+        self.rhs.eval(env)
     }
     fn set_stdin(&mut self, stdin: Stdio) {
         self.lhs.set_stdin(stdin);
@@ -176,10 +224,10 @@ impl <'a> Pipe<'a> {
 }
 
 impl Statement for Pipe<'_> {
-    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
+    fn eval(&mut self, env: &mut Environment) -> InterpreterResult<Box<dyn Process>> {
         self.lhs.set_stdout(Stdio::piped);
-        self.rhs.set_stdin(self.lhs.eval()?.get_stdout());
-        self.rhs.eval()
+        self.rhs.set_stdin(self.lhs.eval(env)?.get_stdout());
+        self.rhs.eval(env)
     }
     fn set_stdin(&mut self, stdin: Stdio) {
         self.lhs.set_stdin(stdin);
@@ -219,7 +267,7 @@ impl Redirect {
 }
 
 impl Statement for Redirect {
-    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
+    fn eval(&mut self, env: &mut Environment) -> InterpreterResult<Box<dyn Process>> {
         let target = physical::expand(&self.target);
         let mut opts = OpenOptions::new();
         opts.write(true).create(true);
@@ -229,7 +277,7 @@ impl Statement for Redirect {
         };
         let file = opts.open(target)?;
         self.cmd.inner.stdout(file);
-        self.cmd.eval()
+        self.cmd.eval(env)
     }
     fn set_stdin(&mut self, stdin: Stdio) {
         self.cmd.inner.stdin(stdin);
@@ -248,7 +296,7 @@ impl CD {
 }
 
 impl Statement for CD {
-    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>> {
+    fn eval(&mut self, env: &mut Environment) -> InterpreterResult<Box<dyn Process>> {
        let mut p = CDProcess{ target: self.target.clone(), result: None };
         if !p.wait() {
             return Err(InterpreterError{message: "".to_string()})
@@ -262,7 +310,7 @@ impl Statement for CD {
 }
 
 pub trait Statement {
-    fn eval(&mut self) -> InterpreterResult<Box<dyn Process>>;
+    fn eval(&mut self, env: &mut Environment) -> InterpreterResult<Box<dyn Process>>;
     fn set_stdin(&mut self, stdin: Stdio);
     fn set_stdout(&mut self, stdout: fn() -> Stdio);
 }
@@ -279,3 +327,17 @@ fn main() {
     // println!("{:?}", shlex::split("ls ; ls"));
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[test]
+    fn aasdasd() {
+        println!("{:?}", "a=b".split('=').map(str::to_string).collect::<Vec<String>>());
+        println!("{:?}", "a".split('=').map(str::to_string).collect::<Vec<String>>());
+        println!("{:?}", "a=".split('=').map(str::to_string).collect::<Vec<String>>());
+        println!("{:?}", "=a".split('=').map(str::to_string).collect::<Vec<String>>());
+        println!("{:?}", "=".split('=').map(str::to_string).collect::<Vec<String>>());
+        println!("{:?}", "".split('=').map(str::to_string).collect::<Vec<String>>());
+    }
+}
